@@ -1,0 +1,16 @@
+#
+# MYSQL SERVICE TO TEST LOCALLY IF NO DB IS AVAILABLE
+#
+version: '3.3'
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - './dockerdata/mysql/data:/var/lib/mysql'
+    ports:
+      - '3306:3306'
