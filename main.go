@@ -20,62 +20,78 @@ type statsT struct {
 	UnixTime          int
 }
 
+type configT struct {
+	MysqlMaxOpenConns         int
+	MaxOpenConns              int
+	MaxIdleConns              int
+	ConnMaxLifetime           int
+	ConnMaxIdleTime           int
+	SelectsToRun              int
+	SelectSleepSec            int
+	RampUpIntervalMs          int
+	RampUpSelects             int
+	MysqlCommandFilterKeyword string
+	StatsCollectionMs         int
+	SelectsBatches            int
+}
+
+var config = configT{
+	MysqlMaxOpenConns:         5000,
+	MaxOpenConns:              50,
+	MaxIdleConns:              10,
+	ConnMaxLifetime:           3,
+	ConnMaxIdleTime:           1,
+	SelectsToRun:              1000,
+	SelectSleepSec:            2,
+	RampUpIntervalMs:          150,
+	RampUpSelects:             50,
+	MysqlCommandFilterKeyword: "mysqlpooltesting",
+	StatsCollectionMs:         150,
+}
+
 var db *sql.DB
-var mysqlMaxOpenConns = 5000
-var maxOpenConns = 50
-var maxIdleConns = 10
-var connMaxLifetime = 3
-var connMaxIdleTime = 1
-var selectsToRun = 1000
+
 var selectsFired = 0
 var selectsCompleted = 0
-var selectSleepSec = 3
-var rampUpIntervalMillisec = 150 // time to wait before running the next selects
-var rampUpSelects = 100          //number of selects to run every ramp up interval
+var selectsBatchesFired = 0
 var dbUser = "root"
 var dbPassword = "root"
 var dbHost = "127.0.0.1"
 var dbPort = "3306"
 var selectString string
 var wg sync.WaitGroup
-var mysqlCommandFilterKeyword = "mysqlpooltesting"
+var wgSelects sync.WaitGroup
 var mx sync.Mutex
-var statsCollectionMs int
 var stats statsT
 var StatsHistory struct {
-	Config struct {
-		MysqlMaxOpenConns         int
-		MaxOpenConns              int
-		MaxIdleConns              int
-		ConnMaxLifetime           int
-		ConnMaxIdleTime           int
-		SelectsToRun              int
-		SelectSleep               int
-		RampUpIntervalMs          int
-		RampUpSelects             int
-		MysqlCommandFilterKeyword string
-	}
-	Stats []statsT
+	StartTimeUnix int64
+	EndTimeUnix   int64
+	Stats         []statsT
 }
 
 func main() {
+	StatsHistory.StartTimeUnix = time.Now().Unix()
 	//TODO PASS VALUES WE WANT TO CHANGE WITH COMMAND AND RETRIEVE THEM HERE BEFORE STARTING
 	ctx, ctxCancelFn := context.WithCancel(context.Background())
 	connect()
 	defer closeConnection()
 
-	pushConfigValues()
-	initialiseStatsHistory()
+	pushConfigValuesToDbObject()
+	calculateSelectBatches()
 
+	wg.Add(1)
+	go printProgress(ctx)
+
+	wg.Add(1)
 	go collectStatsLooper(ctx)
+
 	selectsCannon()
-	fmt.Println("All selects fired... now waiting...")
-	wg.Wait()
+	wgSelects.Wait()
+	StatsHistory.EndTimeUnix = time.Now().Unix()
 
-	fmt.Println("Ending the world...")
-
-	//RECYCLE THE WAIT GROUP FOR ANOTHER TASK!
-	wgAdd("ctxcancel")
+	//give time to the progress to update
+	//before cancelling the context
+	time.Sleep(500 * time.Millisecond)
 	ctxCancelFn()
 	wg.Wait()
 
@@ -87,64 +103,73 @@ func main() {
 	fmt.Printf("%s", string(jsonBytes))
 
 }
+func calculateSelectBatches() {
+	config.SelectsBatches = config.SelectsToRun / config.RampUpSelects
+	if config.SelectsToRun%config.RampUpSelects > 0 {
+		config.SelectsBatches++
+	}
+}
 
 func collectStatsLooper(ctx context.Context) {
 	for {
 		select {
-		case <-time.After(500 * time.Millisecond):
-			fmt.Println("stats...")
+		case <-time.After(50 * time.Millisecond):
+			//todo collect stats here
 		case <-ctx.Done():
-			fmt.Println("cancelled....")
 			wg.Done()
 			return
 		} //end select
 	} //end for loop
 }
 
-func initialiseStatsHistory() {
-	StatsHistory.Config.MysqlMaxOpenConns = mysqlMaxOpenConns
-	StatsHistory.Config.MaxOpenConns = maxOpenConns
-	StatsHistory.Config.MaxIdleConns = maxIdleConns
-	StatsHistory.Config.ConnMaxLifetime = connMaxLifetime
-	StatsHistory.Config.ConnMaxIdleTime = connMaxIdleTime
-	StatsHistory.Config.SelectsToRun = selectsToRun
-	StatsHistory.Config.SelectSleep = selectSleepSec
-	StatsHistory.Config.RampUpIntervalMs = rampUpIntervalMillisec
-	StatsHistory.Config.RampUpSelects = rampUpSelects
-	StatsHistory.Config.MysqlCommandFilterKeyword = mysqlCommandFilterKeyword
+func printProgress(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Print("\n\n")
+			wg.Done()
+			return
+		case <-time.After(100 * time.Millisecond):
+			fmt.Printf("\rSelects Fired %d Running %d Completed %d (%d%%)  %ds   ",
+				selectsFired,
+				db.Stats().InUse,
+				selectsCompleted,
+				selectsCompleted*100/config.SelectsToRun,
+				time.Now().Unix()-StatsHistory.StartTimeUnix)
+		} //end select
+	} //end for loop
 }
 
-func pushConfigValues() {
-	setMaxOpenConns(maxOpenConns)
-	setMaxIdleConns(maxIdleConns)
-	setConnMaxLifetime(connMaxLifetime)
-	setConnMaxIdleTime(connMaxIdleTime)
+func pushConfigValuesToDbObject() {
+	setMaxOpenConns(config.MaxOpenConns)
+	setMaxIdleConns(config.MaxIdleConns)
+	setConnMaxLifetime(config.ConnMaxLifetime)
+	setConnMaxIdleTime(config.ConnMaxIdleTime)
 
-	setMysqlMaxOpenConns(mysqlMaxOpenConns)
-	selectString = fmt.Sprintf("select sleep(%d); -- %s", selectSleepSec, mysqlCommandFilterKeyword)
+	setMysqlMaxOpenConns(config.MysqlMaxOpenConns)
+	selectString = fmt.Sprintf("select sleep(%d); -- %s", config.SelectSleepSec, config.MysqlCommandFilterKeyword)
 }
 
 func selectsCannon() {
-	for selectsFired < selectsToRun {
-		for i := 0; i < rampUpSelects; i++ {
-			selectsFired++
-			wgAdd(fmt.Sprintf("%d", selectsFired))
-			go selectRun(selectsFired)
-
+	var selectsToRunThisLoop int
+	for selectsFired < config.SelectsToRun {
+		if (selectsFired + config.RampUpSelects) > config.SelectsToRun {
+			selectsToRunThisLoop = config.SelectsToRun - selectsFired
+		} else {
+			selectsToRunThisLoop = config.SelectsToRun
 		}
-		time.Sleep(time.Duration(rampUpIntervalMillisec) * time.Millisecond)
+		for i := 0; i < selectsToRunThisLoop; i++ {
+			selectsFired++
+			wgSelects.Add(1)
+			go selectRun(selectsFired)
+		}
+		selectsBatchesFired++
+		time.Sleep(time.Duration(config.RampUpIntervalMs) * time.Millisecond)
 	}
 }
 
-func wgDone(who string) {
-	wg.Done()
-}
-func wgAdd(who string) {
-	wg.Add(1)
-}
-
 func selectRun(sequence int) {
-	defer wgDone(fmt.Sprintf("%d", sequence))
+	defer wgSelects.Done()
 	_, err := db.Exec(selectString)
 	if err != nil {
 		panic(err)
@@ -173,36 +198,36 @@ func getConnDns() string {
 }
 
 func setMaxOpenConns(v int) {
-	maxOpenConns = v
+	config.MaxOpenConns = v
 	db.SetMaxOpenConns(v)
 }
 
 func getMaxOpenConns() int {
-	return maxOpenConns
+	return config.MaxOpenConns
 }
 
 func setMaxIdleConns(v int) {
-	maxIdleConns = v
+	config.MaxIdleConns = v
 	db.SetMaxIdleConns(v)
 }
 func getMaxIdleConns() int {
-	return maxIdleConns
+	return config.MaxIdleConns
 }
 
 func setConnMaxLifetime(m int) {
-	connMaxLifetime = m
+	config.ConnMaxLifetime = m
 	db.SetConnMaxLifetime(time.Minute * time.Duration(m))
 }
 func getConnMaxLifetime() int {
-	return connMaxLifetime
+	return config.ConnMaxLifetime
 }
 
 func setConnMaxIdleTime(m int) {
-	connMaxIdleTime = m
+	config.ConnMaxIdleTime = m
 	db.SetConnMaxIdleTime(time.Minute * time.Duration(m))
 }
 func getConnMaxIdleTime() int {
-	return connMaxIdleTime
+	return config.ConnMaxIdleTime
 }
 func setMysqlMaxOpenConns(v int) {
 	sql := fmt.Sprintf("set global max_connections = %d;", v)
